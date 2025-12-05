@@ -16,27 +16,66 @@ export const useMedBooking = (contract, account) => {
 
     try {
       // Check if registered as doctor
-      const doctorData = await contract.getDoctorDetails(account);
-      if (doctorData.isActive) {
-        setIsDoctor(true);
-        setUserProfile({
-          type: 'doctor',
-          ...doctorData,
-        });
-        return;
+      try {
+        const doctorData = await contract.getDoctorDetails(account);
+        // Check if doctor is actually registered (isActive will be false for unregistered)
+        if (doctorData && doctorData.isActive) {
+          setIsDoctor(true);
+          setIsPatient(false);
+          setUserProfile({
+            type: 'doctor',
+            ...doctorData,
+          });
+          return;
+        }
+      } catch (doctorErr) {
+        // If getDoctorDetails fails, user is not a doctor - continue to check patient
+        // Only log if it's not a "missing revert data" error (which is expected for unregistered users)
+        if (!doctorErr.message?.includes("missing revert data") && 
+            !doctorErr.message?.includes("CALL_EXCEPTION")) {
+          console.log("Doctor check failed (user not registered as doctor):", doctorErr.message);
+        }
       }
 
       // Check if registered as patient
-      const patientData = await contract.patients(account);
-      if (patientData.isRegistered) {
-        setIsPatient(true);
-        setUserProfile({
-          type: 'patient',
-          ...patientData,
-        });
+      try {
+        const patientData = await contract.patients(account);
+        if (patientData && patientData.isRegistered) {
+          setIsPatient(true);
+          setIsDoctor(false);
+          setUserProfile({
+            type: 'patient',
+            ...patientData,
+          });
+          return;
+        }
+      } catch (patientErr) {
+        // If patients() fails, user is not registered as patient
+        if (!patientErr.message?.includes("missing revert data") && 
+            !patientErr.message?.includes("CALL_EXCEPTION")) {
+          console.log("Patient check failed (user not registered as patient):", patientErr.message);
+        }
       }
+
+      // If we get here, user is not registered as either
+      setIsDoctor(false);
+      setIsPatient(false);
+      setUserProfile(null);
     } catch (err) {
-      console.error("Error fetching user profile:", err);
+      // Handle RPC errors more gracefully
+      if (err.message?.includes("too many errors") || 
+          err.message?.includes("RPC endpoint")) {
+        console.error("RPC endpoint error - make sure Anvil is running on http://localhost:8545");
+        // Don't throw - just log and reset state
+        setIsDoctor(false);
+        setIsPatient(false);
+        setUserProfile(null);
+      } else {
+        console.error("Error fetching user profile:", err);
+        setIsDoctor(false);
+        setIsPatient(false);
+        setUserProfile(null);
+      }
     }
   }, [contract, account]);
 
@@ -85,7 +124,10 @@ export const useMedBooking = (contract, account) => {
 
   // Register as doctor
   const registerDoctor = useCallback(async (name, specialization, hospitalName, consultationFee) => {
-    if (!contract || !account) return;
+    if (!contract || !account) {
+      toast.error("Please connect your wallet first", { id: "register-doctor" });
+      return false;
+    }
 
     try {
       setLoading(true);
@@ -93,20 +135,32 @@ export const useMedBooking = (contract, account) => {
       // Check if already registered before attempting registration
       try {
         const doctorData = await contract.getDoctorDetails(account);
-        if (doctorData.isActive) {
+        if (doctorData && doctorData.isActive) {
           toast.error("You are already registered as a doctor!", { id: "register-doctor" });
           setLoading(false);
           return false;
         }
       } catch (checkErr) {
-        // If check fails, continue with registration attempt
-        console.log("Pre-check failed, continuing with registration:", checkErr);
+        // If check fails (user not registered), continue with registration attempt
+        // This is expected for new registrations
+        if (!checkErr.message?.includes("missing revert data") && 
+            !checkErr.message?.includes("CALL_EXCEPTION")) {
+          console.log("Pre-check note:", checkErr.message);
+        }
       }
       
+      // Validate inputs
+      if (!name || !specialization || !hospitalName || !consultationFee) {
+        toast.error("Please fill in all fields", { id: "register-doctor" });
+        setLoading(false);
+        return false;
+      }
+
       const feeInWei = parseEther(consultationFee.toString());
-      const tx = await contract.registerDoctor(name, specialization, hospitalName, feeInWei);
       
       toast.loading("Registering doctor...", { id: "register-doctor" });
+      
+      const tx = await contract.registerDoctor(name, specialization, hospitalName, feeInWei);
       await tx.wait();
       
       toast.success("Successfully registered as doctor!", { id: "register-doctor" });
@@ -114,6 +168,16 @@ export const useMedBooking = (contract, account) => {
       return true;
     } catch (err) {
       console.error("Error registering doctor:", err);
+      
+      // Handle RPC errors first
+      if (err.message?.includes("too many errors") || 
+          err.message?.includes("RPC endpoint") ||
+          err.code === "UNKNOWN_ERROR") {
+        const errorMessage = "RPC endpoint error. Please ensure Anvil is running on http://localhost:8545";
+        toast.error(errorMessage, { id: "register-doctor", duration: 10000 });
+        return false;
+      }
+      
       // Extract more detailed error message
       let errorMessage = "Failed to register as doctor";
       
@@ -153,6 +217,9 @@ export const useMedBooking = (contract, account) => {
         errorMessage = "Insufficient funds for transaction";
       } else if (errorMessage.includes("network") || errorMessage.includes("chain")) {
         errorMessage = "Network error. Please ensure you're on Localhost 8545 (Chain ID: 31337)";
+      } else if (errorMessage.includes("missing revert data") || 
+                 errorMessage.includes("CALL_EXCEPTION")) {
+        errorMessage = "Contract call failed. Please ensure the contract is deployed and Anvil is running.";
       }
       
       toast.error(errorMessage, { id: "register-doctor", duration: 8000 });
@@ -164,7 +231,10 @@ export const useMedBooking = (contract, account) => {
 
   // Register as patient
   const registerPatient = useCallback(async (name, contactInfo) => {
-    if (!contract || !account) return;
+    if (!contract || !account) {
+      toast.error("Please connect your wallet first", { id: "register-patient" });
+      return false;
+    }
 
     try {
       setLoading(true);
@@ -172,19 +242,30 @@ export const useMedBooking = (contract, account) => {
       // Check if already registered before attempting registration
       try {
         const patientData = await contract.patients(account);
-        if (patientData.isRegistered) {
+        if (patientData && patientData.isRegistered) {
           toast.error("You are already registered as a patient!", { id: "register-patient" });
           setLoading(false);
           return false;
         }
       } catch (checkErr) {
-        // If check fails, continue with registration attempt
-        console.log("Pre-check failed, continuing with registration:", checkErr);
+        // If check fails (user not registered), continue with registration attempt
+        // This is expected for new registrations
+        if (!checkErr.message?.includes("missing revert data") && 
+            !checkErr.message?.includes("CALL_EXCEPTION")) {
+          console.log("Pre-check note:", checkErr.message);
+        }
       }
       
-      const tx = await contract.registerPatient(name, contactInfo);
+      // Validate inputs
+      if (!name || !contactInfo) {
+        toast.error("Please fill in all fields", { id: "register-patient" });
+        setLoading(false);
+        return false;
+      }
       
       toast.loading("Registering patient...", { id: "register-patient" });
+      
+      const tx = await contract.registerPatient(name, contactInfo);
       await tx.wait();
       
       toast.success("Successfully registered as patient!", { id: "register-patient" });
@@ -192,6 +273,16 @@ export const useMedBooking = (contract, account) => {
       return true;
     } catch (err) {
       console.error("Error registering patient:", err);
+      
+      // Handle RPC errors first
+      if (err.message?.includes("too many errors") || 
+          err.message?.includes("RPC endpoint") ||
+          err.code === "UNKNOWN_ERROR") {
+        const errorMessage = "RPC endpoint error. Please ensure Anvil is running on http://localhost:8545";
+        toast.error(errorMessage, { id: "register-patient", duration: 10000 });
+        return false;
+      }
+      
       // Extract more detailed error message
       let errorMessage = "Failed to register as patient";
       
@@ -231,6 +322,9 @@ export const useMedBooking = (contract, account) => {
         errorMessage = "Insufficient funds for transaction";
       } else if (errorMessage.includes("network") || errorMessage.includes("chain")) {
         errorMessage = "Network error. Please ensure you're on Localhost 8545 (Chain ID: 31337)";
+      } else if (errorMessage.includes("missing revert data") || 
+                 errorMessage.includes("CALL_EXCEPTION")) {
+        errorMessage = "Contract call failed. Please ensure the contract is deployed and Anvil is running.";
       }
       
       toast.error(errorMessage, { id: "register-patient", duration: 8000 });
